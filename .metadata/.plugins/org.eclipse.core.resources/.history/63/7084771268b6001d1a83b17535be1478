@@ -1,0 +1,388 @@
+#include <CT_I2C.h>
+#include <GT911.h>
+GT911_Dev Dev_Now,Dev_Backup;
+
+#define TP_RSI_H       	  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET)	 /* GPIO_SetBits(GPIOB , GPIO_Pin_13)   */
+#define TP_RSI_L         		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET)  /* GPIO_ResetBits(GPIOB , GPIO_Pin_13) */
+
+#define TP_INT_H       	  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET)	 /* GPIO_SetBits(GPIOB , GPIO_Pin_13)   */
+#define TP_INT_L         		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET)  /* GPIO_ResetBits(GPIOB , GPIO_Pin_13) */
+extern I2C_HandleTypeDef hi2c1;
+extern void *	 memset (void *, int, size_t);
+extern void i2c_hw_reset(void);
+extern uint8_t DMAbuf[41];
+extern uint8_t GT911buf[41];
+extern uint8_t GTDMAReadOK_F;
+extern uint8_t GTDMASendOK_F;
+extern uint16_t IICError;								//错误次数计数
+
+static void GT911_Reset_Sequence()
+{
+	GPIO_InitTypeDef GPIO_InitStruct;
+	
+//	GT911_RST_CLK();
+//	GT911_INT_CLK();
+	
+	GPIO_InitStruct.Pin = GT911_RST_PIN | GT911_INT_PIN;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	GPIO_InitStruct.Speed = GPIO_SPEED_HIGH;
+	HAL_GPIO_Init(GT911_RST_PORT, &GPIO_InitStruct);
+	
+	HAL_GPIO_WritePin(GT911_RST_PORT,GT911_RST_PIN,GPIO_PIN_RESET);    
+	HAL_Delay(1000);
+	HAL_GPIO_WritePin(GT911_INT_PORT,GT911_INT_PIN,GPIO_PIN_RESET);    
+	HAL_Delay(1000);
+	HAL_GPIO_WritePin(GT911_RST_PORT,GT911_RST_PIN,GPIO_PIN_SET);    
+	HAL_Delay(2000);
+	
+	GPIO_InitStruct.Pin = GT911_INT_PIN;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	HAL_GPIO_Init(GT911_INT_PORT, &GPIO_InitStruct);
+	
+	HAL_Delay(100);
+}
+
+static uint8_t GT911_WR_Reg(uint16_t reg,uint8_t *buf,uint8_t len)
+{
+	uint8_t i;
+	uint8_t ret=0;
+	CT_I2C_Start();	
+ 	CT_I2C_Send_Byte(CT_CMD_WR);
+	CT_I2C_Wait_Ack();
+	CT_I2C_Send_Byte(reg>>8);   	
+	CT_I2C_Wait_Ack(); 	 										  		   
+	CT_I2C_Send_Byte(reg&0XFF);   	
+	CT_I2C_Wait_Ack();  
+	for(i=0;i<len;i++)
+	{	   
+    CT_I2C_Send_Byte(buf[i]);  
+		ret=CT_I2C_Wait_Ack();
+		if(ret)break;  
+	}
+  CT_I2C_Stop();					
+	return ret; 
+}
+
+static void GT911_RD_Reg(uint16_t reg,uint8_t *buf,uint8_t len)
+{
+	uint8_t i;
+ 	CT_I2C_Start();	
+ 	CT_I2C_Send_Byte(CT_CMD_WR);  
+	CT_I2C_Wait_Ack();
+ 	CT_I2C_Send_Byte(reg>>8);   
+	CT_I2C_Wait_Ack(); 	 										  		   
+ 	CT_I2C_Send_Byte(reg&0XFF);   	
+	CT_I2C_Wait_Ack();  
+ 	CT_I2C_Stop();  
+	
+ 	CT_I2C_Start();  	 	   
+	CT_I2C_Send_Byte(CT_CMD_RD);     
+	CT_I2C_Wait_Ack();	   
+	for(i=0;i<len;i++)
+	{	   
+		buf[i]=CT_I2C_Read_Byte(i==(len-1)?0:1); 
+	} 
+  CT_I2C_Stop();   
+}
+
+static uint8_t GT911_ReadStatue(void)
+{
+	uint8_t buf[4];
+	GT911_RD_Reg(GT911_PRODUCT_ID_REG, (uint8_t *)&buf[0], 3);
+	GT911_RD_Reg(GT911_CONFIG_REG, (uint8_t *)&buf[3], 1);
+	return buf[3];
+}
+
+static uint16_t GT911_ReadFirmwareVersion(void)
+{
+	uint8_t buf[2];
+
+	GT911_RD_Reg(GT911_FIRMWARE_VERSION_REG, buf, 2);
+
+	return ((uint16_t)buf[1] << 8) + buf[0];
+}
+
+void IICReset(void)
+{
+	SET_BIT(hi2c1.Instance->CR1, I2C_CR1_STOP);	//发�?�一个停止位
+	hi2c1.State = HAL_I2C_STATE_READY;			//改变IIC状�?�为准备状�??
+	hi2c1.Mode = HAL_I2C_MODE_NONE;				//标准模式
+	i2c_hw_reset();								//复位IIC总线
+	IICError ++;								//错误次数计数
+}
+
+#define regNum	9	//读取寄存器字节数
+void GT911_Scan(void)
+{
+	uint8_t Clearbuf = 0;
+	uint8_t i = 0;
+
+	if (Dev_Now.Touch == 1)
+	{
+		Dev_Now.Touch = 0;
+		if(GTDMASendOK_F)	//判断DMA是否发送完成
+		{
+			GTDMASendOK_F = 0;
+			if(HAL_I2C_Mem_Read_DMA(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, DMAbuf, regNum)) //IIC读取regNum个字节数据
+			{
+				IICReset();	//异常则重启IIC总线
+				return;
+			}
+		}
+		else
+		{
+			if(HAL_I2C_Mem_Write_DMA(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, &Clearbuf, 1))	//写入读取完成通知从设备
+			{
+				IICReset();	//异常则重启IIC总线
+				return;
+			}
+		}
+	}
+
+	if(GTDMAReadOK_F)	//判断DMA是否接收完成
+	{
+		GTDMAReadOK_F = 0;
+		if ((GT911buf[0]&0x80) == 0x00)	//坐标是否（或按键）已经准备好
+		{
+			if(HAL_I2C_Mem_Write_DMA(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, &Clearbuf, 1))//写入读取完成通知从设备
+			{
+				IICReset();	//异常则重启IIC总线
+				return;
+			}
+		}
+		else
+		{
+			Dev_Now.TouchpointFlag = GT911buf[0];
+			Dev_Now.TouchCount = GT911buf[0]&0x0f;
+
+			if(HAL_I2C_Mem_Write_DMA(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, &Clearbuf, 1))//写入读取完成通知从设备
+			{
+				IICReset();	//异常则重启IIC总线
+				return;
+			}
+			Dev_Now.Touchkeytrackid[0] = GT911buf[1];		//第一个触摸点的坐标
+			Dev_Now.X[0] = ((uint16_t)GT911buf[3] << 8) + GT911buf[2];
+			Dev_Now.Y[0] = ((uint16_t)GT911buf[5] << 8) + GT911buf[4];
+			Dev_Now.S[0] = ((uint16_t)GT911buf[7] << 8) + GT911buf[6];
+
+			Dev_Now.Touchkeytrackid[1] = GT911buf[9];		//第二个触摸点的坐标
+			Dev_Now.X[1] = ((uint16_t)GT911buf[11] << 8) + GT911buf[10];
+			Dev_Now.Y[1] = ((uint16_t)GT911buf[13] << 8) + GT911buf[12];
+			Dev_Now.S[1] = ((uint16_t)GT911buf[15] << 8) + GT911buf[14];
+
+			Dev_Now.Touchkeytrackid[2] = GT911buf[17];		//第三个触摸点的坐标
+			Dev_Now.X[2] = ((uint16_t)GT911buf[19] << 8) + GT911buf[18];
+			Dev_Now.Y[2] = ((uint16_t)GT911buf[21] << 8) + GT911buf[20];
+			Dev_Now.S[2] = ((uint16_t)GT911buf[23] << 8) + GT911buf[22];
+
+			Dev_Now.Touchkeytrackid[3] = GT911buf[25];		//第四个触摸点的坐标
+			Dev_Now.X[3] = ((uint16_t)GT911buf[27] << 8) + GT911buf[26];
+			Dev_Now.Y[3] = ((uint16_t)GT911buf[29] << 8) + GT911buf[28];
+			Dev_Now.S[3] = ((uint16_t)GT911buf[31] << 8) + GT911buf[30];
+
+			Dev_Now.Touchkeytrackid[4] = GT911buf[33];		//第五个触摸点的坐标
+			Dev_Now.X[4] = ((uint16_t)GT911buf[35] << 8) + GT911buf[34];
+			Dev_Now.Y[4] = ((uint16_t)GT911buf[37] << 8) + GT911buf[36];
+			Dev_Now.S[4] = ((uint16_t)GT911buf[39] << 8) + GT911buf[38];
+
+			for (i = 0; i< Dev_Backup.TouchCount;i++)	//检查触摸点的坐标边界
+			{
+				if(Dev_Now.Y[i]<20)Dev_Now.Y[i]=20;
+				if(Dev_Now.Y[i]>GT911_MAX_HEIGHT-20)Dev_Now.Y[i]=GT911_MAX_HEIGHT-20;
+				if(Dev_Now.X[i]<20)Dev_Now.X[i]=20;
+				if(Dev_Now.X[i]>GT911_MAX_WIDTH-20)Dev_Now.X[i]=GT911_MAX_WIDTH-20;
+			}
+			for (i=0;i<Dev_Now.TouchCount;i++)
+			{
+				if(Dev_Now.Y[i]<20)Dev_Now.Y[i]=20;
+				if(Dev_Now.Y[i]>GT911_MAX_HEIGHT-20)Dev_Now.Y[i]=GT911_MAX_HEIGHT-20;
+				if(Dev_Now.X[i]<20)Dev_Now.X[i]=20;
+				if(Dev_Now.X[i]>GT911_MAX_WIDTH-20)Dev_Now.X[i]=GT911_MAX_WIDTH-20;
+
+				Dev_Backup.X[i] = Dev_Now.X[i];
+				Dev_Backup.Y[i] = Dev_Now.Y[i];
+				Dev_Backup.TouchCount = Dev_Now.TouchCount;
+			}
+		}
+	}
+}
+
+//#define regNum	9	//读取寄存器字节数
+//void GT911_Scan(void)
+//{
+//	uint8_t buf[41];
+//	uint8_t Clearbuf = 0;
+//	uint8_t i;
+//
+//	if (Dev_Now.Touch == 1)
+//	{
+//		Dev_Now.Touch = 0;
+//		if(HAL_I2C_Mem_Read(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, buf, regNum, 10000))
+//		{
+//			SET_BIT(hi2c1.Instance->CR1, I2C_CR1_STOP);	//发�?�一个停止位
+//			hi2c1.State = HAL_I2C_STATE_READY;			//改变IIC状�?�为准备状�??
+//			hi2c1.Mode = HAL_I2C_MODE_NONE;				//标准模式
+//			i2c_hw_reset();								//复位IIC总线
+//			return;
+//		}
+//
+//		if ((buf[0]&0x80) == 0x00)	//坐标是否（或按键）已经准备好
+//		{
+//			if(HAL_I2C_Mem_Write(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, &Clearbuf, 1, 10000))
+//			{
+//				return;
+//			}
+//			HAL_Delay(10);
+//		}
+//		else
+//		{
+//			Dev_Now.TouchpointFlag = buf[0];
+//			Dev_Now.TouchCount = buf[0]&0x0f;
+//			if (Dev_Now.TouchCount > 5)
+//			{
+//				if(HAL_I2C_Mem_Write(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, &Clearbuf, 1, 10000))
+//				{
+//					return;
+//				}
+//				return ;
+//			}
+//
+//			if(HAL_I2C_Mem_Write(&hi2c1, CT_CMD_WR, GT911_READ_XY_REG, I2C_MEMADD_SIZE_16BIT, &Clearbuf, 1, 10000))
+//			{
+//				return;
+//			}
+//			Dev_Now.Touchkeytrackid[0] = buf[1];
+//			Dev_Now.X[0] = ((uint16_t)buf[3] << 8) + buf[2];
+//			Dev_Now.Y[0] = ((uint16_t)buf[5] << 8) + buf[4];
+//			Dev_Now.S[0] = ((uint16_t)buf[7] << 8) + buf[6];
+//
+//			Dev_Now.Touchkeytrackid[1] = buf[9];
+//			Dev_Now.X[1] = ((uint16_t)buf[11] << 8) + buf[10];
+//			Dev_Now.Y[1] = ((uint16_t)buf[13] << 8) + buf[12];
+//			Dev_Now.S[1] = ((uint16_t)buf[15] << 8) + buf[14];
+//
+//			Dev_Now.Touchkeytrackid[2] = buf[17];
+//			Dev_Now.X[2] = ((uint16_t)buf[19] << 8) + buf[18];
+//			Dev_Now.Y[2] = ((uint16_t)buf[21] << 8) + buf[20];
+//			Dev_Now.S[2] = ((uint16_t)buf[23] << 8) + buf[22];
+//
+//			Dev_Now.Touchkeytrackid[3] = buf[25];
+//			Dev_Now.X[3] = ((uint16_t)buf[27] << 8) + buf[26];
+//			Dev_Now.Y[3] = ((uint16_t)buf[29] << 8) + buf[28];
+//			Dev_Now.S[3] = ((uint16_t)buf[31] << 8) + buf[30];
+//
+//			Dev_Now.Touchkeytrackid[4] = buf[33];
+//			Dev_Now.X[4] = ((uint16_t)buf[35] << 8) + buf[34];
+//			Dev_Now.Y[4] = ((uint16_t)buf[37] << 8) + buf[36];
+//			Dev_Now.S[4] = ((uint16_t)buf[39] << 8) + buf[38];
+//
+//			for (i = 0; i< Dev_Backup.TouchCount;i++)
+//			{
+//				if(Dev_Now.Y[i]<20)Dev_Now.Y[i]=20;
+//				if(Dev_Now.Y[i]>GT911_MAX_HEIGHT-20)Dev_Now.Y[i]=GT911_MAX_HEIGHT-20;
+//				if(Dev_Now.X[i]<20)Dev_Now.X[i]=20;
+//				if(Dev_Now.X[i]>GT911_MAX_WIDTH-20)Dev_Now.X[i]=GT911_MAX_WIDTH-20;
+//			}
+//			for (i=0;i<Dev_Now.TouchCount;i++)
+//			{
+//				if(Dev_Now.Y[i]<20)Dev_Now.Y[i]=20;
+//				if(Dev_Now.Y[i]>GT911_MAX_HEIGHT-20)Dev_Now.Y[i]=GT911_MAX_HEIGHT-20;
+//				if(Dev_Now.X[i]<20)Dev_Now.X[i]=20;
+//				if(Dev_Now.X[i]>GT911_MAX_WIDTH-20)Dev_Now.X[i]=GT911_MAX_WIDTH-20;
+//
+//				Dev_Backup.X[i] = Dev_Now.X[i];
+//				Dev_Backup.Y[i] = Dev_Now.Y[i];
+//				Dev_Backup.TouchCount = Dev_Now.TouchCount;
+//			}
+//
+//		}
+//	}
+//}
+
+//void GT911_Scan(void)
+//{
+//	uint8_t buf[41];
+//	uint8_t Clearbuf = 0;
+//	uint8_t i;
+//
+//	if (Dev_Now.Touch == 1)
+//	{
+//		Dev_Now.Touch = 0;
+//		GT911_RD_Reg(GT911_READ_XY_REG, buf, 1);
+//
+//		if ((buf[0]&0x80) == 0x00)
+//		{
+//			GT911_WR_Reg(GT911_READ_XY_REG, (uint8_t *)&Clearbuf, 1);
+//			HAL_Delay(10);
+//		}
+//		else
+//		{
+//			Dev_Now.TouchpointFlag = buf[0];
+//			Dev_Now.TouchCount = buf[0]&0x0f;
+//			if (Dev_Now.TouchCount > 5)
+//			{
+//				GT911_WR_Reg(GT911_READ_XY_REG, (uint8_t *)&Clearbuf, 1);
+//				return ;
+//			}
+//			GT911_RD_Reg(GT911_READ_XY_REG+1, &buf[1], Dev_Now.TouchCount*8);
+//			GT911_WR_Reg(GT911_READ_XY_REG, (uint8_t *)&Clearbuf, 1);
+//
+//			Dev_Now.Touchkeytrackid[0] = buf[1];
+//			Dev_Now.X[0] = ((uint16_t)buf[3] << 8) + buf[2];
+//			Dev_Now.Y[0] = ((uint16_t)buf[5] << 8) + buf[4];
+//			Dev_Now.S[0] = ((uint16_t)buf[7] << 8) + buf[6];
+//
+//			Dev_Now.Touchkeytrackid[1] = buf[9];
+//			Dev_Now.X[1] = ((uint16_t)buf[11] << 8) + buf[10];
+//			Dev_Now.Y[1] = ((uint16_t)buf[13] << 8) + buf[12];
+//			Dev_Now.S[1] = ((uint16_t)buf[15] << 8) + buf[14];
+//
+//			Dev_Now.Touchkeytrackid[2] = buf[17];
+//			Dev_Now.X[2] = ((uint16_t)buf[19] << 8) + buf[18];
+//			Dev_Now.Y[2] = ((uint16_t)buf[21] << 8) + buf[20];
+//			Dev_Now.S[2] = ((uint16_t)buf[23] << 8) + buf[22];
+//
+//			Dev_Now.Touchkeytrackid[3] = buf[25];
+//			Dev_Now.X[3] = ((uint16_t)buf[27] << 8) + buf[26];
+//			Dev_Now.Y[3] = ((uint16_t)buf[29] << 8) + buf[28];
+//			Dev_Now.S[3] = ((uint16_t)buf[31] << 8) + buf[30];
+//
+//			Dev_Now.Touchkeytrackid[4] = buf[33];
+//			Dev_Now.X[4] = ((uint16_t)buf[35] << 8) + buf[34];
+//			Dev_Now.Y[4] = ((uint16_t)buf[37] << 8) + buf[36];
+//			Dev_Now.S[4] = ((uint16_t)buf[39] << 8) + buf[38];
+//
+//			for (i = 0; i< Dev_Backup.TouchCount;i++)
+//			{
+//				if(Dev_Now.Y[i]<20)Dev_Now.Y[i]=20;
+//				if(Dev_Now.Y[i]>GT911_MAX_HEIGHT-20)Dev_Now.Y[i]=GT911_MAX_HEIGHT-20;
+//				if(Dev_Now.X[i]<20)Dev_Now.X[i]=20;
+//				if(Dev_Now.X[i]>GT911_MAX_WIDTH-20)Dev_Now.X[i]=GT911_MAX_WIDTH-20;
+//			}
+//			for (i=0;i<Dev_Now.TouchCount;i++)
+//			{
+//				if(Dev_Now.Y[i]<20)Dev_Now.Y[i]=20;
+//				if(Dev_Now.Y[i]>GT911_MAX_HEIGHT-20)Dev_Now.Y[i]=GT911_MAX_HEIGHT-20;
+//				if(Dev_Now.X[i]<20)Dev_Now.X[i]=20;
+//				if(Dev_Now.X[i]>GT911_MAX_WIDTH-20)Dev_Now.X[i]=GT911_MAX_WIDTH-20;
+//
+//				Dev_Backup.X[i] = Dev_Now.X[i];
+//				Dev_Backup.Y[i] = Dev_Now.Y[i];
+//				Dev_Backup.TouchCount = Dev_Now.TouchCount;
+//			}
+//
+//		}
+//	}
+//}
+
+void GT911_init(void)
+{
+	Dev_Now.GT911_RST=0;
+	GT911_Reset_Sequence();
+	CT_I2C_Init();
+	GT911_ReadStatue();
+	GT911_ReadFirmwareVersion();
+	Dev_Now.GT911_RST=1;
+}

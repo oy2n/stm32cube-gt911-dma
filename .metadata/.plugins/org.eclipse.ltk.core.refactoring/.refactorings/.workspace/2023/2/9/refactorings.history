@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Delete resource &apos;GT911_DMA&apos;" deleteContents="true" description="Delete resource &apos;GT911_DMA&apos;" element1="/GT911_DMA" flags="7" id="org.eclipse.ltk.core.refactoring.delete.resources" resources="1" stamp="1677478207825"/>
+</session>

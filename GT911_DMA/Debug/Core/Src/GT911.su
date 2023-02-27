@@ -1,0 +1,4 @@
+GT911.c:22:13:i2c_hw_reset	32	static
+GT911.c:49:6:GT911_init	32	static
+GT911.c:82:6:IICReset	8	static
+GT911.c:92:6:GT911_Scan	24	static
